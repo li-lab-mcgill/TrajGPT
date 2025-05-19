@@ -26,7 +26,7 @@ if __name__ == '__main__':
 
     # forecasting task
     parser.add_argument('--seq_len', type=int, default=256, help='input sequence length')
-    parser.add_argument('--label_len', type=int, default=128, help='start token length')
+    # parser.add_argument('--label_len', type=int, default=128, help='start token length')
     parser.add_argument('--pred_len', type=int, default=128, help='prediction sequence length')
 
     # the hyperparameters for TrajGPT
@@ -112,7 +112,7 @@ if __name__ == '__main__':
             batch_x = batch_x.to(device)
             batch_t = batch_t.to(device)
             model_optim.zero_grad()
-            loss = model(X=batch_x, t=batch_t, y=batch_x, forward_impl=args.forward_impl)
+            loss = model(X=batch_x, input_time=batch_t, y=batch_x, forward_impl=args.forward_impl)
             loss.backward()
             model_optim.step()
             train_loss.append(loss.item())
@@ -124,7 +124,7 @@ if __name__ == '__main__':
             for i, (batch_x, batch_t) in enumerate(valid_dataloader):
                 batch_x = batch_x.to(device)
                 batch_t = batch_t.to(device)
-                loss = model(X=batch_x, t=batch_t, y=batch_x, forward_impl=args.forward_impl)
+                loss = model(X=batch_x, input_time=batch_t, y=batch_x, forward_impl=args.forward_impl)
                 valid_loss.append(loss.item())
             print('epoch: {}, valid_loss: {}'.format(epoch, np.mean(valid_loss)))
         # no need for pre-training stage

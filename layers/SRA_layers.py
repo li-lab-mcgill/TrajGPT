@@ -9,8 +9,6 @@ from layers.Xpos import XPOS
 from layers.snippets import *
 import gc
 
-logger = logging.get_logger(__name__)
-
 
 class Selective_Recurrent_Attention(nn.Module):
     def __init__(self, config: TrajGPTConfig):
@@ -121,7 +119,6 @@ class Selective_Recurrent_Attention(nn.Module):
         q, k = self.xpos.rotate_queries_and_keys(q, k, offset=sequence_offset) # xpos for q and k
         q, k, v = split_heads((q, k, v), B, T, self.config.num_heads)
         decay = self.get_data_dependent_decay(hidden_states)
-        self.decay = decay
         # SRA recurrent attention computation
         if forward_impl == 'parallel':
             decay_mask = self.get_parallel_decay_mask(t, decay, retention_mask=retention_mask)

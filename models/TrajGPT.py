@@ -134,13 +134,6 @@ class TrajGPT(nn.Module):
             logits = self.head(outputs)
             return self.compute_pretrain_loss(logits, y) # return pre-trained loss
         elif self.head_type == "forecast":
-
-
-
-
-
-
-
             logits_seq = self._run_forecast(hidden_states, input_time, target_time, y)
             logits = torch.stack(logits_seq, dim=1) # stack into (B, M, vocab_size) and compute loss
             return self.compute_forecast_loss(logits, y)
@@ -162,7 +155,6 @@ class TrajGPT(nn.Module):
         """
         B, T, D     = hidden_states.shape
         M = target_time.size(1) if target_time is not None else 1
-        cfg = self.SRA_blocks[-1].sra.config
         qkv = self.SRA_blocks[-1].sra.qkv(hidden_states)
 
         q, k, v = torch.split(qkv,

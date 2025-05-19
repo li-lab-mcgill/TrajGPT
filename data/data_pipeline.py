@@ -38,7 +38,7 @@ class EHRDataset(Dataset):
         seq_phecodes.extend([0] * (self.max_length - len(seq_phecodes))) # pad
 
         # tokenize, truncate, and pad ages
-        seq_ages = [0] + [age for age in patient.age_at_diag] # Initial age for [CLS] token is 0
+        seq_ages = [0] + [age for age in patient.age_at_diag] # Initial age for [SOS] token is 0
         if len(seq_ages) > self.max_length:
             seq_ages = truncate_sequences(self.max_length, seq_ages)[0] # keep the last few max_length number of tokens
         # pad with the age year
@@ -68,7 +68,6 @@ def data_provider(batch_size,
     patient_ids = total_data['id'].unique()
     train_ids, temp_ids = train_test_split(patient_ids, test_size=1-train_ratio, random_state=42)
     valid_ids, test_ids = train_test_split(temp_ids, test_size=1-(valid_ratio/(1-train_ratio)), random_state=42)
-    print(len(train_ids), len(valid_ids), len(test_ids))
 
     # Using the split IDs to filter the original DataFrame
     train_data = total_data[total_data['id'].isin(train_ids)]
