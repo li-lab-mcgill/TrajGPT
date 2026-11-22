@@ -2,6 +2,7 @@
 # Licensed under The MIT License [see LICENSE for details]
 # https://github.com/microsoft/torchscale/blob/2b101355d79dc48b8cdf4bc58a94f98be69f182a/torchscale/component/xpos_relative_position.py
 
+import math
 import torch
 import torch.nn as nn
 
@@ -33,6 +34,40 @@ def apply_rotary_pos_emb(x, sin, cos, scale=1):
     sin, cos = map(lambda t: duplicate_interleave(t * scale), (sin, cos))
     # einsum notation for lambda t: repeat(t[offset:x.shape[1]+offset,:], "n d -> () n () (d j)", j=2)
     return (x * cos) + (rotate_every_two(x) * sin)
+
+
+class TemporalRoPE(nn.Module):
+    """Pure rotary encoding of actual timestamps for head-wise Q/K tensors.
+
+    Timestamps use a fixed unit (months in PopHR). Centering each sequence on
+    its first timestamp preserves relative time while avoiding large absolute
+    phases. There is no XPOS exponential scaling in this time-aware path.
+    """
+
+    def __init__(self, head_dim, time_scale=1.0, base=10000.0):
+        super().__init__()
+        if head_dim <= 0 or head_dim % 2:
+            raise ValueError('Temporal RoPE requires a positive even head dimension.')
+        if not math.isfinite(time_scale) or time_scale <= 0:
+            raise ValueError('time_scale must be finite and positive.')
+        self.head_dim = head_dim
+        self.time_scale = float(time_scale)
+        inv_freq = base ** (-torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+    @staticmethod
+    def _rotate(x, sin, cos):
+        paired_rotation = torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(-2)
+        return x * cos.to(x.dtype) + paired_rotation * sin.to(x.dtype)
+
+    def rotate_queries_and_keys(self, q, k, times):
+        # TrajGPT validates and sanitizes these shared times before its SRA stack.
+        positions = times.to(device=q.device, dtype=torch.float32)
+        positions = (positions - positions[:, :1]) / self.time_scale
+        phases = positions[:, None, :, None] * self.inv_freq.float().to(q.device)
+        sin = phases.sin().repeat_interleave(2, dim=-1)
+        cos = phases.cos().repeat_interleave(2, dim=-1)
+        return self._rotate(q, sin, cos), self._rotate(k, sin, cos)
 
 
 class XPOS(nn.Module):

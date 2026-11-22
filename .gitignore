@@ -1,0 +1,23 @@
+# Local patient data, definitions and embedding files; keep only loader code.
+/data/*
+!/data/__init__.py
+!/data/data_pipeline.py
+
+# Model weights, optimizer state, patient splits and generated reports.
+/checkpoints/
+/results/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.model
+
+# Python, notebook and editor caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.idea/
+.DS_Store
+.venv/
+venv/

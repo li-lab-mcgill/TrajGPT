@@ -1,17 +1,14 @@
-import time
-from typing import List, Optional, Tuple, Union
-from layers.configs import TrajGPTConfig
+from typing import Optional, Tuple, TYPE_CHECKING
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from transformers.utils import logging
-from layers.Xpos import XPOS
-from layers.snippets import *
-import gc
+from layers.Xpos import XPOS, TemporalRoPE
+if TYPE_CHECKING:
+    from layers.configs import TrajGPTConfig
 
 
 class Selective_Recurrent_Attention(nn.Module):
-    def __init__(self, config: TrajGPTConfig):
+    def __init__(self, config: 'TrajGPTConfig'):
         super().__init__()
         self.config = config
         self.qkv = nn.Linear(config.d_model,
@@ -22,6 +19,10 @@ class Selective_Recurrent_Attention(nn.Module):
         self.proj = nn.Linear(config.v_dim, config.d_model, bias=config.use_bias_in_sra_out)
         self.gn = nn.GroupNorm(num_groups=config.num_heads, num_channels=config.v_dim, affine=False)
         self.xpos = XPOS(config.qk_dim)
+        self.time_mode = getattr(config, 'time_mode', 'event_order')
+        if self.time_mode == 'time_conditioned':
+            self.time_rope = TemporalRoPE(
+                config.qk_dim // config.num_heads, getattr(config, 'time_scale', 1.0))
 
         # initialize gamma, found
         if config.use_default_gamma:
@@ -44,17 +45,18 @@ class Selective_Recurrent_Attention(nn.Module):
         self.tau = config.tau  # temperature for the gamma
 
     def get_parallel_decay_mask(self, t, decay, retention_mask=None):
+        # Decay remains event-wise. Actual time enters Q/K through temporal RoPE.
         B, T, H = decay.shape
-        # compute cumulative decay product b_n
-        b = torch.cumprod(decay, dim=1)
-        # pairwise ratio b_n / b_m
-        ratio = b.unsqueeze(2) / b.unsqueeze(1)
-        D = ratio.permute(0, 3, 1, 2)  # (B, H, T, T)
-        # Apply lower triangular mask to ensure causality
-        decay_mask = torch.tril(D, diagonal=0)  # [batch_size, num_heads, seq_len, seq_len]
+        # log(b_n / b_m) avoids underflow from long cumulative products.
+        # Clip the unused upper triangle before exponentiating: its positive
+        # log ratios could otherwise overflow and introduce NaN gradients.
+        log_b = decay.float().clamp_min(torch.finfo(torch.float32).tiny).log().cumsum(dim=1)
+        log_ratio = log_b.unsqueeze(2) - log_b.unsqueeze(1)
+        D = log_ratio.clamp_max(0).exp().permute(0, 3, 1, 2)
+        decay_mask = torch.tril(D).to(decay.dtype)
         if retention_mask is not None:
             # Expand the retention mask to match the decay mask dimensions
-            retention_mask = retention_mask.float().view(-1, 1, 1, T)
+            retention_mask = retention_mask.to(dtype=decay_mask.dtype).view(-1, 1, 1, T)
             decay_mask = decay_mask * retention_mask
         else:
             decay_mask = decay_mask
@@ -66,7 +68,7 @@ class Selective_Recurrent_Attention(nn.Module):
         decay = torch.sigmoid(gamma) ** (1.0 / self.tau)
         return decay
 
-    def parallel_retention(self, q, k, v, decay_mask):
+    def parallel_retention(self, q, k, v, decay_mask, use_cache=True):
         """
         q,  # bsz * num_heads * len * qk_dim
         k,  # bsz * num_heads * len * qk_dim
@@ -78,11 +80,13 @@ class Selective_Recurrent_Attention(nn.Module):
         retention = retention * decay_mask
         output = retention @ v #
 
-        # kv cache
-        current_kv = k.unsqueeze(-1) * v.unsqueeze(-2)
-        # [bsz, num_heads, qk_dim, v_dim]
-        intra_decay = decay_mask[:, :, -1, :, None, None]
-        current_kv = (current_kv * intra_decay).sum(2)
+        # Basic generation recomputes its prefix and does not need a cache.
+        # For legacy consumers, reduce directly rather than materializing a
+        # [batch, heads, time, qk_dim, v_dim] tensor.
+        current_kv = None
+        if use_cache:
+            intra_decay = decay_mask[:, :, -1, :, None]
+            current_kv = k.transpose(-1, -2) @ (v * intra_decay)
         return output, current_kv, retention
 
     def recurrent_retention(self, q, k, v, past_key_value=None, decay=None, retention_mask=None):
@@ -110,22 +114,26 @@ class Selective_Recurrent_Attention(nn.Module):
         forward_impl: str = 'parallel',
         sequence_offset: Optional[int] = 0,
         output_retentions: Optional[bool] = None,
+        use_cache: bool = True,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, Optional[torch.FloatTensor]]:
         B, T, d = hidden_states.size()
 
         q, k, v = self.qkv(hidden_states).split(
             [self.config.qk_dim, self.config.qk_dim, self.config.v_dim], dim=-1)
 
-        q, k = self.xpos.rotate_queries_and_keys(q, k, offset=sequence_offset) # xpos for q and k
-        q, k, v = split_heads((q, k, v), B, T, self.config.num_heads)
+        if self.time_mode != 'time_conditioned':
+            q, k = self.xpos.rotate_queries_and_keys(q, k, offset=sequence_offset)
+        q, k, v = [x.reshape(B, T, self.config.num_heads, -1).transpose(1, 2)
+                   for x in (q, k, v)]
+        if self.time_mode == 'time_conditioned':
+            q, k = self.time_rope.rotate_queries_and_keys(q, k, t)
         decay = self.get_data_dependent_decay(hidden_states)
         # SRA recurrent attention computation
         if forward_impl == 'parallel':
             decay_mask = self.get_parallel_decay_mask(t, decay, retention_mask=retention_mask)
             retention_out, curr_kv, retention_weights = self.parallel_retention(q, k, v,
-                                                                                decay_mask=decay_mask)
-            torch.cuda.empty_cache()
-            gc.collect()
+                                                                                decay_mask=decay_mask,
+                                                                                use_cache=use_cache)
         elif forward_impl == 'recurrent':
             for n in range(T):
                 gamma_n = decay[:, n, :]
@@ -154,7 +162,7 @@ class SRA_Block(nn.Module):
     '''
     An SRA block consists of an SRA module and an MLP layer
     '''
-    def __init__(self, config: TrajGPTConfig):
+    def __init__(self, config: 'TrajGPTConfig'):
         super().__init__()
         self.config = config
 
@@ -180,6 +188,7 @@ class SRA_Block(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         sequence_offset: Optional[int] = 0,
         output_retentions: Optional[bool] = False,
+        use_cache: bool = True,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, Optional[torch.FloatTensor]]:
         sra_outs = self.sra(self.ln1(hidden_states),
                             t=t,
@@ -187,7 +196,8 @@ class SRA_Block(nn.Module):
                             past_key_value=past_key_value,
                             forward_impl=forward_impl,
                             sequence_offset=sequence_offset,
-                            output_retentions=output_retentions)
+                            output_retentions=output_retentions,
+                            use_cache=use_cache)
         # Original SRA layer with residual connection
         sra = sra_outs[0]
         curr_kv = sra_outs[1]
