@@ -6,6 +6,7 @@
 # Model weights, optimizer state, patient splits and generated reports.
 /checkpoints/
 /results/
+/UMAP_vis.py
 *.pt
 *.pth
 *.ckpt
